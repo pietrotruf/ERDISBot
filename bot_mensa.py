@@ -245,7 +245,7 @@ def format_message(mensa_name: str, day: date, data: dict | None) -> str:
 # ======================================================= BANNER / CONSENSO ===
 # Scrivi qui il messaggio del banner. Accetta HTML di Telegram
 # (<b>grassetto</b>, <i>corsivo</i>, <a href="...">link</a>).
-BANNER_TEXT = "[INSERISCI QUI IL MESSAGGIO DEL BANNER]"
+BANNER_TEXT = "⚠️Attenzione⚠️\nQuesto bot non è affiliato con ERDIS e affini. Controllate sempre che il menù sia giusto anche dal sito. Non mi assumo alcuna responsabilità"
 
 # Se in futuro modifichi il banner e vuoi che tutti lo riaccettino,
 # aumenta questo numero.
