@@ -5,14 +5,22 @@ Installazione:
     pip install "python-telegram-bot>=21" requests beautifulsoup4
 
 Avvio:
-    token in variabile d'ambiente TELEGRAM_TOKEN oppure in un file .env
-    (una riga: TELEGRAM_TOKEN=il_tuo_token), poi:
-    python bot_mensa.py
+    token e impostazioni in variabili d'ambiente oppure in un file .env
+    (una riga per variabile), ad esempio:
+        TELEGRAM_TOKEN=il_tuo_token
+        DAILY_NOTIFY_TIME=11:30
+    poi:  python bot_mensa.py
 
 Comandi:
-    /start  -> scegli la mensa (la prima volta), poi mostra il menu di oggi
-    /oggi   -> menu di oggi della mensa scelta
-    /sede   -> cambia mensa
+    /start         -> scegli la mensa (la prima volta), poi mostra il menu di oggi
+    /oggi          -> menu di oggi della mensa scelta
+    /sede          -> cambia mensa
+    /impostazioni  -> mensa scelta e avviso giornaliero (on/off)
+
+Variabili configurabili (da .env o dal codice, vedi sezione CONFIGURAZIONE):
+    DAILY_NOTIFY_TIME          ora dell'avviso giornaliero, HH:MM
+    CACHE_TTL_MINUTES          dopo quanti minuti si riscarica la pagina
+    REFRESH_MIN_AGE_MINUTES    età minima della copia perché 🔄 la riscarichi
 
 Per aggiungere una mensa: vedi il dizionario MENSE qui sotto.
 """
@@ -24,42 +32,78 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes)
 
 logging.basicConfig(level=logging.INFO)
 
-def _load_token() -> str:
-    """Legge TELEGRAM_TOKEN dalla variabile d'ambiente oppure dal file .env
-    (nella stessa cartella dello script o in quella da cui lanci il bot)."""
-    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-    if not token:
-        for env_file in (Path(__file__).with_name(".env"), Path.cwd() / ".env"):
-            if env_file.is_file():
-                for line in env_file.read_text(encoding="utf-8-sig").splitlines():
-                    line = line.strip()
-                    if line.startswith("export "):
-                        line = line[7:]
-                    if line.startswith("TELEGRAM_TOKEN") and "=" in line:
-                        token = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-            if token:
-                break
-    if not token:
-        raise SystemExit("Token mancante: imposta la variabile TELEGRAM_TOKEN "
-                         "oppure crea un file .env con TELEGRAM_TOKEN=il_tuo_token")
-    return token
+def _load_dotenv():
+    """Carica le variabili dal file .env (stessa cartella dello script o cartella
+    da cui lanci il bot). Le variabili d'ambiente già impostate hanno la precedenza."""
+    for env_file in (Path(__file__).with_name(".env"), Path.cwd() / ".env"):
+        if not env_file.is_file():
+            continue
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:]
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.split(" #", 1)[0].strip().strip("\"'")
+            os.environ.setdefault(key.strip(), value)
 
 
-TOKEN = _load_token()
+_load_dotenv()
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit("Token mancante: imposta la variabile TELEGRAM_TOKEN "
+                     "oppure crea un file .env con TELEGRAM_TOKEN=il_tuo_token")
+
 USERS_FILE = Path(os.environ.get("USERS_FILE") or Path(__file__).with_name("utenti.json"))  # scelte salvate per chat
+STATE_FILE = USERS_FILE.with_name("stato.json")  # ricorda quando è partito l'ultimo avviso
+
+# ========================================================== CONFIGURAZIONE ===
+# Cambia i valori qui sotto, oppure metti nel .env (o in una variabile d'ambiente)
+# la variabile con lo stesso nome: quella ha la precedenza sul valore scritto qui.
+DAILY_NOTIFY_TIME_DEFAULT = "11:30"      # ora dell'avviso giornaliero (HH:MM, ora locale)
+CACHE_TTL_MINUTES_DEFAULT = 60           # oltre questa età la pagina viene riscaricata
+REFRESH_MIN_AGE_MINUTES_DEFAULT = 5      # il pulsante 🔄 riscarica solo se la copia ha almeno questa età
+NOTIFY_IF_CLOSED = False                 # mandare l'avviso anche se la mensa è chiusa?
+NOTIFY_WINDOW = timedelta(hours=2)       # se il bot era spento all'ora X, recupera entro questo tempo
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"{name}='{raw}' non valido: serve un numero intero")
+
+
+def _env_time(name: str, default: str) -> dtime:
+    raw = os.environ.get(name, default).strip()
+    try:
+        return datetime.strptime(raw, "%H:%M").time()
+    except ValueError:
+        raise SystemExit(f"{name}='{raw}' non valido: usa il formato HH:MM, es. 11:30")
+
+
+DAILY_TIME = _env_time("DAILY_NOTIFY_TIME", DAILY_NOTIFY_TIME_DEFAULT)
+DAILY_TIME_STR = DAILY_TIME.strftime("%H:%M")
+CACHE_TTL = timedelta(minutes=_env_int("CACHE_TTL_MINUTES", CACHE_TTL_MINUTES_DEFAULT))
+REFRESH_MIN_AGE = timedelta(minutes=_env_int("REFRESH_MIN_AGE_MINUTES", REFRESH_MIN_AGE_MINUTES_DEFAULT))
 
 # =========================================================== MENSE (ID) =====
 # L'ID è il valore usato dal sito (<option value="...">) e finisce nell'URL.
@@ -245,7 +289,7 @@ def format_message(mensa_name: str, day: date, data: dict | None) -> str:
 # ======================================================= BANNER / CONSENSO ===
 # Scrivi qui il messaggio del banner. Accetta HTML di Telegram
 # (<b>grassetto</b>, <i>corsivo</i>, <a href="...">link</a>).
-BANNER_TEXT = "⚠️Attenzione⚠️\nQuesto bot non è affiliato con ERDIS e affini. Controllate sempre che il menù sia giusto anche dal sito. Non mi assumo alcuna responsabilità"
+BANNER_TEXT = "[INSERISCI QUI IL MESSAGGIO DEL BANNER]"
 
 # Se in futuro modifichi il banner e vuoi che tutti lo riaccettino,
 # aumenta questo numero.
@@ -280,9 +324,12 @@ def update_user(chat_id: int, **fields):
     USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _accepted(user: dict) -> bool:
+    return bool(user.get("accepted_at")) and user.get("banner_version") == BANNER_VERSION
+
+
 def has_accepted(chat_id: int) -> bool:
-    u = get_user(chat_id)
-    return bool(u.get("accepted_at")) and u.get("banner_version") == BANNER_VERSION
+    return _accepted(get_user(chat_id))
 
 
 def set_accepted(chat_id: int):
@@ -313,30 +360,75 @@ def mense_keyboard() -> InlineKeyboardMarkup:
         [[InlineKeyboardButton(m["name"], callback_data=f"s:{mid}")] for mid, m in MENSE.items()])
 
 
-def menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Aggiorna", callback_data="r"),
-        InlineKeyboardButton("📍 Cambia mensa", callback_data="c"),
-    ]])
+def menu_keyboard(day: date) -> InlineKeyboardMarkup:
+    """Il giorno mostrato finisce nel callback_data del pulsante Aggiorna."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"r:{day:%Y%m%d}"),
+         InlineKeyboardButton("📍 Cambia mensa", callback_data="c")],
+        [InlineKeyboardButton("⚙️ Impostazioni", callback_data="i")],
+    ])
 
 
 CHOOSE_TEXT = "Scegli la mensa:"
 
 
-async def build_text(mensa_id: str) -> str:
+# ---- Cache in memoria: (mensa, giorno) -> (momento del download, dati letti)
+# La pagina HTML viene riscaricata solo se la copia ha più di CACHE_TTL.
+_cache: dict = {}
+_locks: dict = {}
+
+
+async def get_menu_data(mensa_id: str, day: date, force: bool = False) -> dict | None:
+    """Dati del menu: dalla cache se la copia è recente, altrimenti dal sito.
+    force=True (pulsante Aggiorna) riscarica se la copia ha almeno REFRESH_MIN_AGE."""
+    key = (mensa_id, day)
+    lock = _locks.setdefault(key, asyncio.Lock())   # un solo download alla volta per mensa
+    async with lock:
+        now = datetime.now()
+        entry = _cache.get(key)
+        if entry:
+            fetched_at, data = entry
+            age = now - fetched_at
+            ttl = CACHE_TTL if data is not None else REFRESH_MIN_AGE  # "non disponibile": ritenta presto
+            if age < ttl and not (force and age >= REFRESH_MIN_AGE):
+                return data
+
+        page = await asyncio.to_thread(fetch_menu_html, mensa_id, day)
+        if page:
+            data = PARSERS[MENSE[mensa_id]["parser"]](page)
+            for k in [k for k in _cache if k[1] != day]:   # butto le copie dei giorni passati
+                _cache.pop(k, None)
+                _locks.pop(k, None)
+            _cache[key] = (now, data)
+            return data
+
+        if entry and entry[1] is not None:
+            # sito non raggiungibile: tengo la vecchia copia e ritento tra REFRESH_MIN_AGE
+            _cache[key] = (now - CACHE_TTL + REFRESH_MIN_AGE, entry[1])
+            return entry[1]
+        _cache[key] = (now, None)
+        return None
+
+
+def render_view(mensa_id: str, day: date, data: dict | None) -> tuple[str, InlineKeyboardMarkup]:
+    return format_message(MENSE[mensa_id]["name"], day, data), menu_keyboard(day)
+
+
+async def build_view(mensa_id: str, force: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     today = date.today()
-    page = await asyncio.to_thread(fetch_menu_html, mensa_id, today)
-    parser = PARSERS[MENSE[mensa_id]["parser"]]
-    data = parser(page) if page else None
-    return format_message(MENSE[mensa_id]["name"], today, data)
+    data = await get_menu_data(mensa_id, today, force)
+    return render_view(mensa_id, today, data)
 
 
-async def safe_edit(q, text, kb):
+async def safe_edit(q, text, kb) -> bool:
+    """Modifica il messaggio. False se il contenuto era identico."""
     try:
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        return True
     except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
+        if "not modified" in str(e).lower():
+            return False
+        raise
 
 
 async def show_banner(update: Update):
@@ -360,8 +452,8 @@ async def show_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mid is None:
         await update.message.reply_text(CHOOSE_TEXT, reply_markup=mense_keyboard())
         return
-    await update.message.reply_text(await build_text(mid), parse_mode="HTML",
-                                    reply_markup=menu_keyboard())
+    text, kb = await build_view(mid)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def sede(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -379,7 +471,8 @@ async def on_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         set_accepted(chat_id)
         mid = get_choice(chat_id)
         if mid:
-            await safe_edit(q, await build_text(mid), menu_keyboard())
+            text, kb = await build_view(mid)
+            await safe_edit(q, text, kb)
         else:
             await safe_edit(q, CHOOSE_TEXT, mense_keyboard())
     else:
@@ -397,33 +490,193 @@ async def on_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mid not in MENSE:
         return
     set_choice(chat_id, mid)
-    await safe_edit(q, await build_text(mid), menu_keyboard())
+    text, kb = await build_view(mid)
+    await safe_edit(q, text, kb)
+
+
+def shown_day(q) -> date:
+    """Giorno del menu mostrato nel messaggio su cui è stato premuto Aggiorna."""
+    m = re.fullmatch(r"r:(\d{8})", q.data)
+    if m:
+        return datetime.strptime(m.group(1), "%Y%m%d").date()
+    # pulsante di un messaggio vecchio, senza data: uso la data del messaggio
+    return q.message.date.astimezone().date()
 
 
 async def on_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    chat_id = update.effective_chat.id
+    if not has_accepted(chat_id):
+        await q.answer()
+        await show_banner(update)
+        return
+    if q.data == "c":
+        await q.answer()
+        await safe_edit(q, CHOOSE_TEXT, mense_keyboard())
+        return
+
+    # --- Aggiorna
+    mid = get_choice(chat_id)
+    if mid is None:
+        await q.answer()
+        await safe_edit(q, CHOOSE_TEXT, mense_keyboard())
+        return
+    text, kb = await build_view(mid, force=True)
+    if shown_day(q) == date.today():
+        # stesso giorno: aggiorno lo stesso messaggio
+        changed = await safe_edit(q, text, kb)
+        await q.answer("Menu aggiornato" if changed else "Il menu è già aggiornato")
+    else:
+        # giorno diverso: nuovo messaggio, e tolgo i pulsanti dal vecchio
+        await q.answer()
+        await ctx.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+
+
+# ============================================================ IMPOSTAZIONI ===
+
+def settings_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    user = get_user(chat_id)
+    mid = get_choice(chat_id)
+    notify = bool(user.get("notify"))
+    lines = [
+        "⚙️ <b>Impostazioni</b>",
+        "",
+        f"📍 Mensa: <b>{_esc(MENSE[mid]['name']) if mid else 'non scelta'}</b>",
+        f"🔔 Avviso giornaliero: <b>{'attivo' if notify else 'disattivato'}</b>",
+        f"🕐 Orario dell'avviso: <b>{DAILY_TIME_STR}</b>",
+    ]
+    if notify and not mid:
+        lines += ["", "⚠️ Per ricevere l'avviso scegli prima una mensa."]
+    toggle = "🔕 Disattiva avviso" if notify else f"🔔 Attiva avviso ({DAILY_TIME_STR})"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle, callback_data="n")],
+        [InlineKeyboardButton("📍 Cambia mensa", callback_data="c")],
+        [InlineKeyboardButton("⬅️ Indietro", callback_data="b")],
+    ])
+    return "\n".join(lines), kb
+
+
+async def impostazioni(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not has_accepted(chat_id):
         await show_banner(update)
         return
-    if q.data == "c":
-        await safe_edit(q, CHOOSE_TEXT, mense_keyboard())
+    text, kb = settings_view(chat_id)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def on_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id = update.effective_chat.id
+    if not has_accepted(chat_id):
+        await q.answer()
+        await show_banner(update)
         return
-    mid = get_choice(chat_id)
-    if mid is None:
-        await safe_edit(q, CHOOSE_TEXT, mense_keyboard())
+    if q.data == "n":                      # attiva / disattiva l'avviso
+        on = not get_user(chat_id).get("notify")
+        update_user(chat_id, notify=on)
+        await q.answer(f"Avviso attivato alle {DAILY_TIME_STR}" if on else "Avviso disattivato")
     else:
-        await safe_edit(q, await build_text(mid), menu_keyboard())
+        await q.answer()
+    if q.data == "b":                      # torna al menu
+        mid = get_choice(chat_id)
+        if mid:
+            text, kb = await build_view(mid)
+            await safe_edit(q, text, kb)
+        else:
+            await safe_edit(q, CHOOSE_TEXT, mense_keyboard())
+        return
+    text, kb = settings_view(chat_id)
+    await safe_edit(q, text, kb)
+
+
+# ========================================================= AVVISO GIORNALIERO ===
+
+def _read_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_state(state: dict):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def should_send_now(now: datetime, last_sent: str | None) -> bool:
+    """True se è l'ora dell'avviso (o entro NOTIFY_WINDOW dopo) e oggi non è ancora partito."""
+    target = datetime.combine(now.date(), DAILY_TIME)
+    return last_sent != now.date().isoformat() and target <= now < target + NOTIFY_WINDOW
+
+
+async def send_daily(app: Application):
+    """Manda il menu di oggi a chi ha attivato l'avviso. Un solo download per mensa."""
+    today = date.today()
+    by_mensa: dict[str, list[int]] = {}
+    for chat_key, u in load_users().items():
+        if u.get("notify") and u.get("mensa") in MENSE and _accepted(u):
+            by_mensa.setdefault(u["mensa"], []).append(int(chat_key))
+
+    sent = skipped = 0
+    for mid, chat_ids in by_mensa.items():
+        data = await get_menu_data(mid, today)
+        if data is None or (data["closed"] and not NOTIFY_IF_CLOSED):
+            skipped += len(chat_ids)       # menu non pubblicato o mensa chiusa: niente avviso
+            continue
+        text, kb = render_view(mid, today, data)
+        for chat_id in chat_ids:
+            try:
+                await app.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+                sent += 1
+            except Forbidden:              # l'utente ha bloccato il bot
+                update_user(chat_id, notify=False)
+            except TelegramError as e:
+                logging.warning("Avviso non inviato a %s: %s", chat_id, e)
+            await asyncio.sleep(0.05)      # resto sotto il limite di invii di Telegram
+    logging.info("Avviso giornaliero: %d inviati, %d saltati", sent, skipped)
+
+
+async def daily_loop(app: Application):
+    while True:
+        try:
+            now = datetime.now()
+            state = _read_state()
+            if should_send_now(now, state.get("last_daily")):
+                _write_state({**state, "last_daily": now.date().isoformat()})  # prima di inviare: niente doppioni
+                await send_daily(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Errore nell'avviso giornaliero")
+        await asyncio.sleep(30)
+
+
+async def post_init(app: Application):
+    app.bot_data["daily_task"] = asyncio.create_task(daily_loop(app))
+    logging.info("Avviso giornaliero programmato alle %s", DAILY_TIME_STR)
+
+
+async def post_shutdown(app: Application):
+    task = app.bot_data.get("daily_task")
+    if task:
+        task.cancel()
 
 
 def build_app() -> Application:
-    app = Application.builder().token(TOKEN).build()
+    app = (Application.builder().token(TOKEN)
+           .post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler(["start", "oggi"], show_today))
     app.add_handler(CommandHandler("sede", sede))
+    app.add_handler(CommandHandler("impostazioni", impostazioni))
     app.add_handler(CallbackQueryHandler(on_consent, pattern=r"^a:"))
     app.add_handler(CallbackQueryHandler(on_select, pattern=r"^s:"))
-    app.add_handler(CallbackQueryHandler(on_action, pattern=r"^(r|c)$"))
+    app.add_handler(CallbackQueryHandler(on_action, pattern=r"^(r(:\d{8})?|c)$"))
+    app.add_handler(CallbackQueryHandler(on_settings, pattern=r"^(i|n|b)$"))
     return app
 
 
